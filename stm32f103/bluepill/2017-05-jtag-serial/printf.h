@@ -13,7 +13,7 @@
 #define _printf_h_
 
 #include <stdarg.h>
-void printf(const char *fmt, ...);
-void puts(const char *s);
+int printf(const char *fmt, ...);
+int puts(const char *s);
 
 #endif /* _printf_h_ */

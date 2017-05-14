@@ -13,15 +13,14 @@ CFLAGS		= -Wall -Wstrict-prototypes -Os -g \
 		  -fno-pic -ffunction-sections -pipe \
 		  -mthumb -march=armv7-m -mcpu=cortex-m3 \
 		  -Wa,-mthumb,-mcpu=cortex-m3 \
-		  -fno-builtin-free -fno-builtin-printf \
-		  -fno-builtin-puts
+		  -fno-builtin-free
 
 ASFLAGS		:= $(CFLAGS) -D__ASSEMBLY__
 
-LDFLAGS		= -static -g --gc-sections
+LDFLAGS		= -static -g --gc-sections -L /usr/lib/arm-none-eabi/newlib/armv7-m
 LDFLAGS		+= -e startup -T loader.lds -Map loader.map -Ttext $(TEXT_START)
 
-OBJECTS		:= board.o loader.o printf.o usb.o startup_ARMCM3.o
+OBJECTS		:= board.o loader.o jtag.o usb.o printf.o tasklet.o startup_ARMCM3.o
 
 all: loader.bin
 

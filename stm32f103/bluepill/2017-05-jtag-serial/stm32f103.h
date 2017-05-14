@@ -357,8 +357,10 @@ struct dma_regs {
 #define USB_EP_RX_VALID		0x00003000
 
 #define USB_EP_TOGGLE_MASK	0x00007070
-#define USB_EP_IRQ_MASK		0x00008080
-#define USB_EP_WB_MASK		(~(USB_EP_TOGGLE_MASK | USB_EP_IRQ_MASK))
+#define USB_EP_IRQ_MASK		(USB_EP_CTR_RX | USB_EP_CTR_TX)
+#define USB_EP_WB_MASK		(~(USB_EP_TOGGLE_MASK))
+#define USB_EP_TX_WB_MASK	(~(USB_EP_TOGGLE_MASK | USB_EP_CTR_TX))
+#define USB_EP_RX_WB_MASK	(~(USB_EP_TOGGLE_MASK | USB_EP_CTR_RX))
 
 #define USB_RX_COUNT_MASK	0x000003FF
 #define USB_RX_BLCOUNT_SHIFT	10
@@ -440,8 +442,12 @@ struct usart_regs {
 	volatile uint32_t GTPR;
 };
 
-#define USART1		((struct usart_regs *) 0x40013800)
+#define USART1		((struct usart_regs *)    0x40013800)
 #define USART1_SR	((struct usart_sr_bits *) 0x42270000)
+#define USART2		((struct usart_regs *)    0x40004400)
+#define USART2_SR	((struct usart_sr_bits *) 0x42088000)
+#define USART3		((struct usart_regs *)    0x40004800)
+#define USART3_SR	((struct usart_sr_bits *) 0x42090000)
 
 static inline void NVIC_EnableIRQ(enum IRQn irq)
 {
