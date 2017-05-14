@@ -1,9 +1,11 @@
 #include <stddef.h>
 #include <inttypes.h>
+#include <stdio.h>
 
 #include "stm32f103.h"
-#include "printf.h"
 #include "usb.h"
+#include "jtag.h"
+#include "tasklet.h"
 
 struct line_coding {
 	uint32_t	dwDTERate;
@@ -13,7 +15,7 @@ struct line_coding {
 	uint8_t		lineState;
 };
 
-static struct line_coding line_coding = { 57600, 0x00, 0x00, 0x00, 0x00 };
+static struct line_coding line_coding = { 115200, 0x00, 0x00, 0x00, 0x00 };
 
 
 enum string_descriptor_indexes {
@@ -130,6 +132,12 @@ struct cdc_descriptor {
 	struct endpoint_descriptor		out;
 } __attribute__((packed));
 
+struct usbdm_descriptor {
+	struct interface_descriptor		dif;
+	struct endpoint_descriptor		in;
+	struct endpoint_descriptor		out;
+} __attribute__((packed));
+
 struct configuration_descriptor {
 	uint8_t		bLength;
 	uint8_t		bDescriptorType;
@@ -139,6 +147,7 @@ struct configuration_descriptor {
 	uint8_t		iConfiguration;
 	uint8_t		bmAttributes;
 	uint8_t		bMaxPower;
+	struct usbdm_descriptor usbdm_interface;
 	struct cdc_descriptor cdc_interface;
 } __attribute__((packed));
 
@@ -146,8 +155,8 @@ struct configuration_descriptor {
 struct ep_ctx {
 	volatile uint32_t *rx_pm;
 	volatile uint32_t *tx_pm;
-	void (*rx_fn)(struct ep_ctx *ctx, int ep);
-	void (*tx_fn)(struct ep_ctx *ctx, int ep);
+	uint32_t (*rx_fn)(struct ep_ctx *ctx, int ep);
+	uint32_t (*tx_fn)(struct ep_ctx *ctx, int ep);
 };
 
 struct ep_ctx ep_ctx[USB_MAX_ENDPOINTS];
@@ -166,8 +175,8 @@ const struct device_descriptor device_descriptor =
 	.bDeviceSubClass    = 0,
 	.bDeviceProtocol    = 0,
 	.bMaxPacketSize0    = 64,     // EP0 max packet size
-	.idVendor           = 0x03EB, // Atmel
-	.idProduct          = 0x2043, // Joystick demo
+	.idVendor           = 0x15a2, // Freescale Semiconductor, Inc.
+	.idProduct          = 0x0042, // OSBDM debug port
 	.bcdDevice          = 0x0100, // Device version number
 	.iManufacturer      = STRING_DESCRIPTOR_MANUFACTURER,
 	.iProduct           = STRING_DESCRIPTOR_PRODUCT,
@@ -180,16 +189,45 @@ const struct configuration_descriptor configuration_descriptor =
   .bLength                = 9,     // Size of the configuration descriptor
   .bDescriptorType        = CONFIGURATION_DESCRIPTOR,
   .wTotalLength           = sizeof(configuration_descriptor),  // Total size of the configuration descriptor and EP/interface descriptors
-  .bNumInterfaces         = 2,     // Interface count
+  .bNumInterfaces         = 3,     // Interface count
   .bConfigurationValue    = 1,     // Configuration identifer
   .iConfiguration         = 0,
   .bmAttributes           = 0x80,  // Bus powered
   .bMaxPower              = 50,    // Max power of 50*2mA = 100mA
+  .usbdm_interface = {
+    .dif = {
+      .bLength            = 9,    // Size of the interface descriptor
+      .bDescriptorType    = INTERFACE_DESCRIPTOR,
+      .bInterfaceNumber   = 0,    // Interface index
+      .bAlternateSetting  = 0,
+      .bNumEndpoints      = 2,    // 2 endpoints (bulk in, bulk out)
+      .bInterfaceClass    = 0xff, // Vendor specific
+      .bInterfaceSubClass = 0xff,
+      .bInterfaceProtocol = 0xff,
+      .iInterface         = 0,
+    },
+    .in = {
+      .bLength            = 7,    // Size of the endpoint descriptor
+      .bDescriptorType    = ENDPOINT_DESCRIPTOR,
+      .bEndpointAddress   = 0x82, // EP2 IN
+      .bmAttributes       = 0x02, // Bulk EP
+      .wMaxPacketSize     = 64,   // 64 byte packet buffer
+      .bInterval          = 0,
+    },
+    .out = {
+      .bLength            = 7,    // Size of the endpoint descriptor
+      .bDescriptorType    = ENDPOINT_DESCRIPTOR,
+      .bEndpointAddress   = 0x01, // EP1 OUT
+      .bmAttributes       = 0x02, // Bulk EP
+      .wMaxPacketSize     = 64,   // 64 byte packet buffer
+      .bInterval          = 0,
+    },
+  },
   .cdc_interface = {
       .iad = {
           .len                = 8,
           .dtype              = CDC_DESCRIPTOR,  // 11
-          .firstInterface     = 0,
+          .firstInterface     = 1,
           .interfaceCount     = 2,
           .functionClass      = 2,    // CDC
           .functionSubClass   = 2,    // Abstract control model
@@ -199,7 +237,7 @@ const struct configuration_descriptor configuration_descriptor =
       .cif = {
           .bLength            = 9,    // Size of the interface descriptor
           .bDescriptorType    = INTERFACE_DESCRIPTOR,
-          .bInterfaceNumber   = 0,    // Interface index
+          .bInterfaceNumber   = 1,    // Interface index
           .bAlternateSetting  = 0,
           .bNumEndpoints      = 1,    // 1 endpoint (EP2 in)
           .bInterfaceClass    = 2,    // CDC
@@ -231,13 +269,13 @@ const struct configuration_descriptor configuration_descriptor =
           .len                = 5,
           .dtype              = 0x24, // CS interface
           .subtype            = 6, // CDC union
-          .d0                 = 0, // ACM interface idx
-          .d1                 = 1, // Data interface idx
+          .d0                 = 1, // ACM interface idx
+          .d1                 = 2, // Data interface idx
         },
       .ctrl = {
           .bLength            = 7,    // Size of the endpoint descriptor
           .bDescriptorType    = ENDPOINT_DESCRIPTOR,
-          .bEndpointAddress   = 0x82, // EP2 IN
+          .bEndpointAddress   = 0x84, // EP4 IN
           .bmAttributes       = 0x03, // Interrupt EP
           .wMaxPacketSize     = 64,   // 64 byte packet buffer
           .bInterval          = 100,  // poll every 100ms
@@ -245,7 +283,7 @@ const struct configuration_descriptor configuration_descriptor =
       .dif = {
           .bLength            = 9,    // Size of the interface descriptor
           .bDescriptorType    = INTERFACE_DESCRIPTOR,
-          .bInterfaceNumber   = 1,    // Interface index
+          .bInterfaceNumber   = 2,    // Interface index
           .bAlternateSetting  = 0,
           .bNumEndpoints      = 2,    // 2 endpoints (bulk in, bulk out)
           .bInterfaceClass    = 0xa,  // CDC data
@@ -256,7 +294,7 @@ const struct configuration_descriptor configuration_descriptor =
     .in = {
         .bLength            = 7,    // Size of the endpoint descriptor
         .bDescriptorType    = ENDPOINT_DESCRIPTOR,
-        .bEndpointAddress   = 0x81, // EP1 IN
+        .bEndpointAddress   = 0x83, // EP3 IN
         .bmAttributes       = 0x02, // Bulk EP
         .wMaxPacketSize     = 64,   // 64 byte packet buffer
         .bInterval          = 0,
@@ -264,12 +302,12 @@ const struct configuration_descriptor configuration_descriptor =
       .out = {
         .bLength            = 7,    // Size of the endpoint descriptor
         .bDescriptorType    = ENDPOINT_DESCRIPTOR,
-        .bEndpointAddress   = 0x01, // EP1 OUT
+        .bEndpointAddress   = 0x03, // EP3 OUT
         .bmAttributes       = 0x02, // Bulk EP
         .wMaxPacketSize     = 64,   // 64 byte packet buffer
         .bInterval          = 0,
       },
-    },
+  },
 };
 
 static const char *string_descriptors[] = {
@@ -338,13 +376,19 @@ static void usb_reset(void)
 	// Clear toggle bits.
 	USB->EP[0] ^= 0;
 	// Clear interrupt status and set state.
-	USB->EP[0] = USB_EP_RX_VALID | USB_EP_TX_STALL | USB_EP_CONTROL;
+	USB->EP[0] = USB_EP_RX_VALID | USB_EP_TX_NAK | USB_EP_CONTROL;
 	// Set up EP1
 	USB->EP[1] ^= 0;
 	USB->EP[1] = USB_EP_RX_VALID | USB_EP_TX_NAK | USB_EP_BULK | 1;
 	// Set up EP2
 	USB->EP[2] ^= 0;
-	USB->EP[2] = USB_EP_RX_VALID | USB_EP_TX_STALL | USB_EP_INTERRUPT | 2;
+	USB->EP[2] = USB_EP_RX_NAK | USB_EP_TX_NAK | USB_EP_BULK | 2;
+	// Set up EP3
+	USB->EP[3] ^= 0;
+	USB->EP[3] = USB_EP_RX_VALID | USB_EP_TX_NAK | USB_EP_BULK | 3;
+	// Set up EP4
+	USB->EP[4] ^= 0;
+	USB->EP[4] = USB_EP_RX_VALID | USB_EP_TX_NAK | USB_EP_INTERRUPT | 4;
 	// Set address to 0 (unconfigured)
 	USB->DADDR = USB_DADDR_EF;
 }
@@ -455,194 +499,219 @@ int usb_errs = 0;
 static struct usb_request setup_request;
 int setup_nrx;
 
-static void ep0_rx(struct ep_ctx *ctx, int unused_ep)
+static uint32_t ep0_rx(struct ep_ctx *ctx, int unused_ep)
 {
 	uint32_t ep_status = USB->EP[0];
-	uint32_t ep_status_wb = ep_status & USB_EP_WB_MASK;
+	uint32_t ep_status_wb = USB_EP_RX_VALID;
 	int nrx = USB_BTABLE[0].RX_COUNT & USB_RX_COUNT_MASK;
 
 	if (ep_status & USB_EP_SETUP) {
 		usb2mem(&setup_request, ep_ctx[0].rx_pm, min(sizeof(setup_request), nrx));
-		ep_status_wb &= ~USB_EP_STATUS_OUT;
 		setup_nrx = nrx;
 		int tx_count = usb_setup(0, &setup_request, nrx);
 		if (tx_count >= 0) {
-			USB_BTABLE[0].TX_COUNT = tx_count;
 			ep_status_wb |= (ep_status & USB_EPTX_STAT) ^ USB_EP_TX_VALID;
-			if (setup_response_remain > 0) {
-				ep_status_wb &= ~USB_EP_STATUS_OUT;
+			USB_BTABLE[0].TX_COUNT = tx_count;
+			if (setup_response_remain != 0) {
+				ep_status_wb |= USB_EP_STATUS_OUT;
 			}
-		} else {
-			ep_status_wb |= (ep_status & USB_EPTX_STAT) ^ USB_EP_TX_STALL;
 		}
 	} else {
 		if (nrx > 0) {
 			printf("ep0r%x\n", nrx);
 		}
 	}
-	ep_status_wb |= (ep_status & USB_EPRX_STAT) ^ USB_EP_RX_VALID;
 
-	// Write status back. Clears irq bits due to
-	// USB_EP_WB_MASK above.
-	USB->EP[0] = ep_status_wb;
+	return ep_status_wb;
 }
 
-static void ep0_tx(struct ep_ctx *ctx, int unused_ep)
+static uint32_t ep0_tx(struct ep_ctx *ctx, int unused_ep)
 {
-	uint32_t ep_status = USB->EP[0];
-	uint32_t ep_status_wb = ep_status & USB_EP_WB_MASK;
+	uint32_t ep_status_wb = USB_EP_TX_VALID;
+	volatile uint32_t *tx_pm = ep_ctx[0].tx_pm;
 
 	if (set_address) {
 		// Execute deferred address change
 		USB->DADDR = set_address;
 		set_address = 0;
 	}
-	if (ep_status & USB_EP_CTR_TX) {
-		volatile uint32_t *tx_pm = ep_ctx[0].tx_pm;
-		if (setup_response_remain > 0) {
-			int txlen = min(64, setup_response_remain);
-			mem2usb(tx_pm, setup_response, txlen);
-			setup_response += txlen;
-			setup_response_remain -= txlen;
-			USB_BTABLE[0].TX_COUNT = txlen;
-			ep_status_wb |= (ep_status & USB_EPTX_STAT) ^ USB_EP_TX_VALID;
-			if (setup_response_remain == 0) {
-				ep_status_wb &= ~USB_EP_STATUS_OUT;
-			}
-		} else {
-			ep_status_wb |= (ep_status & USB_EPTX_STAT) ^ USB_EP_TX_STALL;
+	if (setup_response_remain > 0) {
+		int txlen = min(64, setup_response_remain);
+		mem2usb(tx_pm, setup_response, txlen);
+		setup_response += txlen;
+		setup_response_remain -= txlen;
+		USB_BTABLE[0].TX_COUNT = txlen;
+		if (setup_response_remain != 0) {
+			ep_status_wb |= USB_EP_STATUS_OUT;
 		}
+	} else {
+		ep_status_wb = USB_EP_TX_STALL;
 	}
 
-	// Write status back. Clears irq bits due to
-	// USB_EP_WB_MASK above.
-	USB->EP[0] = ep_status_wb;
+	return ep_status_wb;
 }
 
-extern char usb_try_getc(void);
+extern int usb_try_getc(char *c);
+extern int usb_try_putc(char c);
+int usb_busy = 0;
 
 static int maybe_send_serial_data(volatile uint32_t *pm)
 {
 	int maxwords = 32;
 	int ntx = 0;
 	while (--maxwords) {
-		uint8_t c1 = usb_try_getc();
-		if (!c1)
+		uint8_t c1, c2;
+		if (!usb_try_getc((char*)&c1))
 			break;
 		ntx++;
-		uint8_t c2 = usb_try_getc();
-		if (c2)
+		if (usb_try_getc((char*)&c2)) {
 			ntx++;
+		} else {
+			c2 = 0;
+		}
 		*(pm++) = c1 | (c2 << 8);
+		// If we had a short read, break so we don't end up with
+		// holes in the buffer.
+		if (ntx & 1)
+			break;
 	}
 	return ntx;
 }
 
-static void ep1_rx(struct ep_ctx *ctx, int unused_ep)
+static uint32_t ep3_rx(struct ep_ctx *ctx, int unused_ep)
 {
-	uint32_t ep_status = USB->EP[1];
-	uint32_t ep_status_wb = ep_status & USB_EP_WB_MASK;
+	int nrx = USB_BTABLE[3].RX_COUNT & USB_RX_COUNT_MASK;
+	char buf[64];
+	usb2mem(buf, ctx->rx_pm, min(sizeof(buf), nrx));
 
-	int nrx = USB_BTABLE[1].RX_COUNT & USB_RX_COUNT_MASK;
-	char c = *ctx->rx_pm;
-
-	ep_status_wb |= (ep_status & USB_EPRX_STAT) ^ USB_EP_RX_VALID;
-	printf("ep1rx %x %x\n", nrx, c);
-
-	// Write status back. Clears irq bits due to
-	// USB_EP_WB_MASK above.
-	USB->EP[1] = ep_status_wb;
-}
-
-static void ep1_tx(struct ep_ctx *ctx, int unused_ep)
-{
-	uint32_t ep_status = USB->EP[1];
-	uint32_t ep_status_wb = ep_status & USB_EP_WB_MASK;
-
-	int ntx;
-	if ((ntx = maybe_send_serial_data(ctx->tx_pm)) > 0) {
-		USB_BTABLE[1].TX_COUNT = ntx;
-		ep_status_wb |= (ep_status & USB_EPTX_STAT) ^ USB_EP_TX_VALID;
-	} else {
-		ep_status_wb |= (ep_status & USB_EPTX_STAT) ^ USB_EP_TX_NAK;
+	for (int i = 0; i < nrx; i++) {
+		usb_try_putc(buf[i]);
 	}
 
-	// Write status back. Clears irq bits due to
-	// USB_EP_WB_MASK above.
-	USB->EP[1] = ep_status_wb;
+	return USB_EP_RX_VALID;
+}
+
+static uint32_t ep3_tx(struct ep_ctx *ctx, int unused_ep)
+{
+	int ntx;
+	if ((ntx = maybe_send_serial_data(ctx->tx_pm)) > 0) {
+		usb_busy = 1;
+		USB_BTABLE[3].TX_COUNT = ntx;
+		return USB_EP_TX_VALID;
+	}
+
+	usb_busy = 0;
+	return USB_EP_TX_NAK;
 }
 
 void poll_usb_console(void)
 {
-	ep1_tx(&ep_ctx[1], 1);
+	if (!usb_busy) {
+		uint32_t ep_status = USB->EP[3];
+		uint32_t ep_status_wb = (ep_status & USB_EP_TX_WB_MASK) | USB_EP_IRQ_MASK;
+		ep_status_wb |= (ep_status & USB_EPTX_STAT) ^ ep3_tx(&ep_ctx[3], 3);
+		USB->EP[3] = ep_status_wb;
+	}
 }
 
-static void ep2_rx(struct ep_ctx *ctx, int unused_ep)
+static uint32_t ep4_rx(struct ep_ctx *ctx, int unused_ep)
 {
-	uint32_t ep_status = USB->EP[2];
-	uint32_t ep_status_wb = ep_status & USB_EP_WB_MASK;
+	int nrx = USB_BTABLE[4].RX_COUNT & USB_RX_COUNT_MASK;
+	printf("ep4rx %x\n", nrx);
 
-	int nrx = USB_BTABLE[2].RX_COUNT & USB_RX_COUNT_MASK;
-	printf("ep2rx %x\n", nrx);
-
-	ep_status_wb |= (ep_status & USB_EPRX_STAT) ^ USB_EP_RX_VALID;
-
-	// Write status back. Clears irq bits due to
-	// USB_EP_WB_MASK above.
-	USB->EP[2] = ep_status_wb;
+	return USB_EP_RX_VALID;
 }
 
-static void ep2_tx(struct ep_ctx *ctx, int unused_ep)
+static uint32_t ep4_tx(struct ep_ctx *ctx, int unused_ep)
 {
-	uint32_t ep_status = USB->EP[0];
-	uint32_t ep_status_wb = ep_status & USB_EP_WB_MASK;
+	printf("ep4tx\n");
 
-	printf("ep2tx\n");
+	return USB_EP_TX_NAK;
+}
 
-	ep_status_wb |= (ep_status & USB_EPTX_STAT) ^ USB_EP_TX_STALL;
+static uint8_t jtag_rx[64];
+static uint8_t jtag_tx[64];
 
-	// Write status back. Clears irq bits due to
-	// USB_EP_WB_MASK above.
-	USB->EP[0] = ep_status_wb;
+static uint32_t ep1_rx(struct ep_ctx *ctx, int unused_ep)
+{
+	int nrx = USB_BTABLE[1].RX_COUNT & USB_RX_COUNT_MASK;
+
+	usb2mem(jtag_rx, ctx->rx_pm, nrx);
+
+	int ntx = jtag_rxtx(jtag_rx, jtag_tx);
+	// Send response
+	if (ntx) {
+		mem2usb(ep_ctx[2].tx_pm, jtag_tx, ntx);
+		USB_BTABLE[2].TX_COUNT = ntx;
+		uint32_t ep_status = USB->EP[2];
+		uint32_t ep_status_wb = ep_status & USB_EP_TX_WB_MASK;
+		ep_status_wb |= (ep_status & USB_EPTX_STAT) ^ USB_EP_TX_VALID;
+		USB->EP[2] = ep_status_wb;
+	}
+
+	return USB_EP_RX_VALID;
+}
+
+static struct tasklet usb_tasklet;
+
+void poll_usb(void);
+
+static void usb_bh(struct tasklet *ctx)
+{
+	poll_usb();
 }
 
 void USB_LP_CAN_RX0_IRQHandler(void)
 {
 	usb_irq = 1;
 	NVIC_DisableIRQ(USB_LP_CAN1_RX0_IRQn);
+	tasklet_schedule(&usb_tasklet);
 }
 
 void poll_usb(void)
 {
-	if (!usb_irq)
+	if (!usb_irq) {
 		return;
+	}
 
 	uint32_t istr = USB->ISTR;
 	uint32_t ep = istr & 7;
 	usb_irqs++;
 
+	if (istr & USB_ISTR_ERR) {
+		uint32_t ep_status = USB->EP[ep];
+		usb_errs++;
+		printf("ERR %lx %lx\n", istr, ep_status);
+	}
 	if (istr & USB_ISTR_RESET) {
 		usb_reset();
 	} else if (istr & USB_ISTR_CTR) {
 		struct ep_ctx *ctx = &ep_ctx[ep];
-		if (istr & USB_ISTR_DIR) {
-			ctx->rx_fn(ctx, ep);
-		} else {
-			ctx->tx_fn(ctx, ep);
-		}
-	}
-	if (istr & USB_ISTR_ERR) {
 		uint32_t ep_status = USB->EP[ep];
-		usb_errs++;
-		printf("ERR %x %x\n", istr, ep_status);
+		uint32_t ep_status_wb = (ep_status & USB_EP_WB_MASK) | USB_EP_IRQ_MASK;
+		if (ep == 0) {
+			ep_status_wb &= ~USB_EP_STATUS_OUT;
+		}
+		if (ep_status & USB_EP_CTR_RX) {
+			ep_status_wb &= ~USB_EP_CTR_RX;
+			if (ctx->rx_fn) {
+				ep_status_wb |= (ep_status & USB_EPRX_STAT) ^ ctx->rx_fn(ctx, ep);
+			}
+		}
+		if (ep_status & USB_EP_CTR_TX) {
+			ep_status_wb &= ~USB_EP_CTR_TX;
+			if (ctx->tx_fn) {
+				ep_status_wb |= (ep_status & USB_EPTX_STAT) ^ ctx->tx_fn(ctx, ep);
+			}
+		}
+		USB->EP[ep] = ep_status_wb;
 	}
 
+	usb_irq = 0;
 	// Clear only interrupt status bits that were set when we
 	// polled it.
 	USB->ISTR = ~istr;
 	NVIC_ClearPendingIRQ(USB_LP_CAN1_RX0_IRQn);
-
-	usb_irq = 0;
 	NVIC_EnableIRQ(USB_LP_CAN1_RX0_IRQn);
 }
 
@@ -656,21 +725,23 @@ void usb_benchmark(void)
 	ta = SYSTICK->CVR;
 	mem2mem(test_buf, test_buf2, sizeof(test_buf));
 	tb = SYSTICK->CVR;
-	printf("mem2mem %x (%x %x)\n", ta - tb, ta, tb);
+	printf("mem2mem %lx (%lx %lx)\n", ta - tb, ta, tb);
 
 	ta = SYSTICK->CVR;
 	usb2mem(test_buf, USB_PM, sizeof(test_buf));
 	tb = SYSTICK->CVR;
-	printf("usb2mem %x (%x %x)\n", ta - tb, ta, tb);
+	printf("usb2mem %lx (%lx %lx)\n", ta - tb, ta, tb);
 
 	ta = SYSTICK->CVR;
 	usbdma2mem(test_buf2, USB_PM, sizeof(test_buf2));
 	tb = SYSTICK->CVR;
-	printf("usbdma2mem %x (%x %x)\n", ta - tb, ta, tb);
+	printf("usbdma2mem %lx (%lx %lx)\n", ta - tb, ta, tb);
 }
 
 void usb_init(void)
 {
+	tasklet_register(&usb_tasklet, "usb_irq", usb_bh);
+
 	// Enable alternate function IO, GPIOA
 	RCC->APB2ENR |= RCC_APB2ENR_AFIOEN;
 	RCC->APB2ENR |= RCC_APB2ENR_IOPAEN;
@@ -709,21 +780,37 @@ void usb_init(void)
 	USB_BTABLE[0].TX_COUNT = 0x0;
 	USB_BTABLE[0].RX_ADDR  = 0x80;
 	USB_BTABLE[0].RX_COUNT = USB_RX_SIZE64;
-	ep_ctx[1].tx_fn = ep1_tx;
+	ep_ctx[3].tx_fn = ep3_tx;
+	ep_ctx[3].rx_fn = ep3_rx;
+	ep_ctx[3].tx_pm = &USB_PM[0xc0 / 2];
+	ep_ctx[3].rx_pm = &USB_PM[0x100 / 2];
+	USB_BTABLE[3].TX_ADDR  = 0xc0;
+	USB_BTABLE[3].TX_COUNT = 0x0;
+	USB_BTABLE[3].RX_ADDR  = 0x100;
+	USB_BTABLE[3].RX_COUNT = USB_RX_SIZE64;
+	ep_ctx[4].tx_fn = ep4_tx;
+	ep_ctx[4].rx_fn = ep4_rx;
+	ep_ctx[4].tx_pm = &USB_PM[0x140 / 2];
+	ep_ctx[4].rx_pm = &USB_PM[0x180 / 2];
+	USB_BTABLE[4].TX_ADDR  = 0x140;
+	USB_BTABLE[4].TX_COUNT = 0x0;
+	USB_BTABLE[4].RX_ADDR  = 0x180;
+	USB_BTABLE[4].RX_COUNT = USB_RX_SIZE64;
+	ep_ctx[1].tx_fn = NULL;
 	ep_ctx[1].rx_fn = ep1_rx;
-	ep_ctx[1].tx_pm = &USB_PM[0xc0 / 2];
-	ep_ctx[1].rx_pm = &USB_PM[0x100 / 2];
-	USB_BTABLE[1].TX_ADDR  = 0xc0;
+	ep_ctx[1].tx_pm = &USB_PM[0x1c0 / 2];
+	ep_ctx[1].rx_pm = &USB_PM[0x1c0 / 2];
+	USB_BTABLE[1].TX_ADDR  = 0x1c0;
 	USB_BTABLE[1].TX_COUNT = 0x0;
-	USB_BTABLE[1].RX_ADDR  = 0x100;
+	USB_BTABLE[1].RX_ADDR  = 0x1c0;
 	USB_BTABLE[1].RX_COUNT = USB_RX_SIZE64;
-	ep_ctx[2].tx_fn = ep2_tx;
-	ep_ctx[2].rx_fn = ep2_rx;
-	ep_ctx[2].tx_pm = &USB_PM[0x140 / 2];
-	ep_ctx[2].rx_pm = &USB_PM[0x180 / 2];
-	USB_BTABLE[2].TX_ADDR  = 0x140;
+	ep_ctx[2].tx_fn = NULL;
+	ep_ctx[2].rx_fn = NULL;
+	ep_ctx[2].tx_pm = &USB_PM[0x1c0 / 2];
+	ep_ctx[2].rx_pm = &USB_PM[0x1c0 / 2];
+	USB_BTABLE[2].TX_ADDR  = 0x1c0;
 	USB_BTABLE[2].TX_COUNT = 0x0;
-	USB_BTABLE[2].RX_ADDR  = 0x180;
+	USB_BTABLE[2].RX_ADDR  = 0x1c0;
 	USB_BTABLE[2].RX_COUNT = USB_RX_SIZE64;
 
 	usb_reset();

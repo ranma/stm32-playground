@@ -1,14 +1,80 @@
 #include <stddef.h>
 #include <inttypes.h>
+#include <stdio.h>
 
 #include "stm32f103.h"
-#include "printf.h"
 #include "usb.h"
+#include "jtag.h"
 
 #define GPIO_CONFIG_TX		0xa	// Alternate function push-pull 2MHz
 #define GPIO_CONFIG_RX		0x4	// Floating input
 
-char uart_tx_ring[64];
+struct ring_info {
+	char *buf;
+	uint32_t *rptr;
+	uint32_t *wptr;
+	uint32_t mask;
+};
+
+int ring_empty(struct ring_info *ring) {
+	uint32_t saved, empty;
+	__disable_irq_save(&saved);
+	empty = *ring->rptr == *ring->wptr;
+	__restore_irq_save(saved);
+	return empty;
+}
+
+int ring_full(struct ring_info *ring) {
+	uint32_t saved, full;
+	__disable_irq_save(&saved);
+	full = *ring->rptr == *ring->wptr + 1;
+	__restore_irq_save(saved);
+	return full;
+}
+
+int ring_try_getc(struct ring_info *ring, char *c) {
+	uint32_t saved, empty;
+	__disable_irq_save(&saved);
+	empty = *ring->rptr == *ring->wptr;
+	if (!empty) {
+		*c = ring->buf[*ring->rptr];
+		*ring->rptr = (*ring->rptr + 1) & ring->mask;
+	}
+	__restore_irq_save(saved);
+	return !empty;
+}
+
+int ring_try_putc(struct ring_info *ring, const char c) {
+	uint32_t saved, full;
+	__disable_irq_save(&saved);
+	full = *ring->rptr == *ring->wptr + 1;
+	if (!full) {
+		ring->buf[*ring->wptr] = c;
+		*ring->wptr = (*ring->wptr + 1) & ring->mask;
+	}
+	__restore_irq_save(saved);
+	return !full;
+}
+
+char uart3_tx_ring[64];
+uint32_t uart3_tx_rptr, uart3_tx_wptr;
+struct ring_info uart3_tx_info = {
+	.buf = uart3_tx_ring,
+	.rptr = &uart3_tx_rptr,
+	.wptr = &uart3_tx_wptr,
+	.mask = sizeof(uart3_tx_ring) - 1,
+};
+
+char uart3_rx_ring[64];
+uint32_t uart3_rx_rptr, uart3_rx_wptr;
+struct ring_info uart3_rx_info = {
+	.buf = uart3_rx_ring,
+	.rptr = &uart3_rx_rptr,
+	.wptr = &uart3_rx_wptr,
+	.mask = sizeof(uart3_rx_ring) - 1,
+};
+
+char uart_tx_ring[1024];
 int empty;
 uint32_t uart_tx_rptr, uart_tx_wptr;
 uint32_t usb_tx_rptr;
@@ -41,33 +107,29 @@ void uart_init(void)
 
 	// Enable USART1 interrupts
 	NVIC_EnableIRQ(USART1_IRQn);
-}
 
-void USART1_IRQHandler(void)
-{
-	uint32_t sr = USART1->SR;
+	// Enable alternate function IO, GPIOB and USART3
+	RCC->APB1ENR |= RCC_APB1ENR_USART3EN;
+	RCC->APB2ENR |= RCC_APB2ENR_AFIOEN;
+	RCC->APB2ENR |= RCC_APB2ENR_IOPBEN;
 
-	if (sr & USART_SR_TXE) {
-		if (uart_tx_rptr != uart_tx_wptr) {
-			USART1->DR = uart_tx_ring[uart_tx_rptr++];
-			uart_tx_rptr &= UART_TX_PTR_MASK;
-		} else {
-			// Disable USART TX empty irq
-			USART1->CR1 &= ~USART_CR1_TXEIE;
-			empty = 1;
-		}
-	}
-}
+	// Configure TX pin on PB10
+	GPIOB->CRH &= ~(0xF << 8);
+	GPIOB->CRH |= GPIO_CONFIG_TX << 8;
 
-char usb_try_getc(void)
-{
-	if (usb_tx_rptr == uart_tx_wptr)
-		return 0;
+	// Configure RX pin on PB11
+	GPIOB->CRH &= ~(0xF << 12);
+	GPIOB->CRH |= GPIO_CONFIG_RX << 12;
 
-	int idx = usb_tx_rptr++;
-	usb_tx_rptr &= UART_TX_PTR_MASK;
+	// Setup UART1
+	USART3->CR1 = USART_CR1_UE|USART_CR1_RXNEIE|USART_CR1_TE|USART_CR1_RE;
+	USART3->CR2 = 0x0000;
+	USART3->CR3 = 0x0000;
+	USART3->BRR = SYS_CLOCK / 2 / 115200;
+	USART3->GTPR = 0x0000;
 
-	return uart_tx_ring[idx];
+	// Enable USART3 interrupts
+	NVIC_EnableIRQ(USART3_IRQn);
 }
 
 static int uart_try_putc(int ch)
@@ -100,10 +162,87 @@ static int uart_try_putc(int ch)
 	return retval;
 }
 
+void USART1_IRQHandler(void)
+{
+	uint32_t sr = USART1->SR;
+
+	if (sr & USART_SR_TXE) {
+		if (uart_tx_rptr != uart_tx_wptr) {
+			USART1->DR = uart_tx_ring[uart_tx_rptr++];
+			uart_tx_rptr &= UART_TX_PTR_MASK;
+		} else {
+			// Disable USART TX empty irq
+			USART1->CR1 &= ~USART_CR1_TXEIE;
+			empty = 1;
+		}
+	}
+	if (sr & USART_SR_RXNE) {
+		char c = USART1->DR;
+		uart_try_putc(c);
+	}
+}
+
+volatile int usb_ring_full;
+volatile int usb_overrun;
+volatile int usb_noise;
+volatile int usb_puts, usb_gets;
+
+void USART3_IRQHandler(void)
+{
+	uint32_t sr = USART3->SR;
+
+	if (sr & USART_SR_RXNE) {
+		char c = USART3->DR;
+		if (!ring_try_putc(&uart3_rx_info, c)) {
+			usb_ring_full++;
+		} else {
+			usb_puts++;
+		}
+	}
+	if (sr & USART_SR_TXE) {
+		char c;
+		if (ring_try_getc(&uart3_tx_info, &c)) {
+			USART3->DR = c;
+		} else {
+			// Disable USART TX empty irq
+			USART3->CR1 &= ~USART_CR1_TXEIE;
+		}
+	}
+	if (sr & USART_SR_ORE) {
+		usb_overrun++;
+	}
+	if (sr & USART_SR_NE) {
+		usb_noise++;
+	}
+}
+
+int usb_try_getc(char *c)
+{
+	int ret = ring_try_getc(&uart3_rx_info, c);
+	if (ret) {
+		usb_gets++;
+	}
+	return ret;
+}
+
+int usb_try_putc(char c)
+{
+	int ret = ring_try_putc(&uart3_tx_info, c);
+	if (ret) {
+		USART3->CR1 |= USART_CR1_TXEIE;
+	} else {
+		usb_ring_full++;
+	}
+	return ret;
+}
+
+volatile int uart_wfi;
+
 void board_putc(int ch)
 {
 	while (!uart_try_putc(ch)) {
 		__WFI();
+		uart_wfi++;
 	}
 }
 
@@ -186,5 +325,6 @@ void SystemInit(void)
 	systick_init();
 	dma_init();
 	uart_init();
+	jtag_init();
 	usb_init();
 }

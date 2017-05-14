@@ -23,12 +23,12 @@ extern void board_putc(int ch);
 /* forward declaration */
 static int PrintChar(char *, char);
 static int PrintString(char *, char *, int);
-static int PrintHex(char *, unsigned long, int);
+static int PrintNum(char *, unsigned long, int, int, int, char);
 
 /* private variable */
 static const char theFatalMsg[] = "lp_Print: ENOBUFS";
 
-static void printf_output(const void *arg, const char *s, int l)
+static void printf_output(const char *s, int l)
 {
     int i;
 
@@ -48,7 +48,7 @@ static void printf_output(const void *arg, const char *s, int l)
 /* -*-
  * A low level printf() function.
  */
-static void
+static int
 lp_Print(const void * arg,
 	 const char *fmt,
 	 va_list ap)
@@ -59,7 +59,10 @@ lp_Print(const void * arg,
     char *s;
     int num;
 
+    int printed = 0;
+    int negFlag;
     int width;
+    char padc;
 
     int length;
 
@@ -72,7 +75,8 @@ lp_Print(const void * arg,
 	    }
 
 	    /* flush the string found so far */
-	    printf_output(arg, fmtStart, fmt-fmtStart);
+	    printf_output(fmtStart, fmt-fmtStart);
+	    printed += fmt-fmtStart;
 
 	    /* are we hitting the end? */
 	    if (*fmt == '\0') break;
@@ -82,6 +86,7 @@ lp_Print(const void * arg,
 	fmt ++;
 
 	width = 0;
+	padc = ' ';
 
 	/* ignore long flag */
 	if (*fmt == 'l') {
@@ -90,6 +95,7 @@ lp_Print(const void * arg,
 
 	/* check for other prefixes */
 	if (*fmt == '0') {
+	    padc = '0';
 	    fmt++;
 	}
 
@@ -100,23 +106,38 @@ lp_Print(const void * arg,
 	}
 
 	/* check format flag */
+	negFlag = 0;
 	switch (*fmt) {
+	 case 'd':
+	    num = va_arg(ap, int); 
+	    if (num < 0) {
+		num = - num;
+		negFlag = 1;
+	    }
+	    length = PrintNum(buf, num, 10, negFlag, width, padc);
+	    printf_output(buf, length);
+	    printed += length;
+	    break;
+
 	 case 'x':
 	    num = va_arg(ap, int);
-	    length = PrintHex(buf, num, width);
-	    printf_output(arg, buf, length);
+	    length = PrintNum(buf, num, 16, 0, width, padc);
+	    printf_output(buf, length);
+	    printed += length;
 	    break;
 
 	 case 'c':
 	    c = (char)va_arg(ap, int);
 	    length = PrintChar(buf, c);
-	    printf_output(arg, buf, length);
+	    printf_output(buf, length);
+	    printed += length;
 	    break;
 
 	 case 's':
 	    s = (char*)va_arg(ap, char *);
 	    length = PrintString(buf, s, width);
-	    printf_output(arg, buf, length);
+	    printf_output(buf, length);
+	    printed += length;
 	    break;
 
 	 case '\0':
@@ -125,11 +146,13 @@ lp_Print(const void * arg,
 
 	 default:
 	    /* output this char as it is */
-	    printf_output(arg, fmt, 1);
+	    printf_output(fmt, 1);
+	    printed += 1;
 	}	/* switch (*fmt) */
 
 	fmt ++;
     }		/* for(;;) */
+    return printed;
 }
 
 
@@ -156,7 +179,8 @@ PrintString(char * buf, char* s, int length)
 }
 
 static int
-PrintHex(char * buf, unsigned long u, int length)
+PrintNum(char * buf, unsigned long u, int base, int negFlag,
+	 int length, char padc)
 {
     /* algorithm :
      *  1. prints the number from left to right in reverse form.
@@ -164,38 +188,44 @@ PrintHex(char * buf, unsigned long u, int length)
      *     the actual length
      *     TRICKY : if left adjusted, no "0" padding.
      *		    if negtive, insert  "0" padding between "0" and number.
-     *  3. we reverse the whole string including paddings
+     *  3. if (!ladjust) we reverse the whole string including paddings
      *  4. otherwise we only reverse the actual string representing the num.
      */
 
-    const char padc = '0';
     int actualLength =0;
     char *p = buf;
     int i;
 
     do {
-	int tmp = u & 15;
+	int tmp = u %base;
 	if (tmp <= 9) {
 	    *p++ = '0' + tmp;
 	} else {
 	    *p++ = 'a' + tmp - 10;
 	}
-	u >>= 4;
+	u /= base;
     } while (u != 0);
+
+    if (negFlag) {
+	*p++ = '-';
+    }
 
     /* figure out actual length and adjust the maximum length */
     actualLength = p - buf;
     if (length < actualLength) length = actualLength;
 
     /* add padding */
-    for (i = actualLength; i< length; i++) buf[i] = padc;
-
+    if (negFlag && (padc == '0')) {
+	for (i = actualLength-1; i< length-1; i++) buf[i] = padc;
+	buf[length -1] = '-';
+    } else {
+	for (i = actualLength; i< length; i++) buf[i] = padc;
+    }
 
     /* prepare to reverse the string */
     {
 	int begin = 0;
-	int end;
-	end = length -1;
+	int end = length -1;
 
 	while (end > begin) {
 	    char tmp = buf[begin];
@@ -210,15 +240,23 @@ PrintHex(char * buf, unsigned long u, int length)
     return length;
 }
 
-void printf(const char *fmt, ...)
+int printf(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    lp_Print(0, fmt, ap);
+    int printed = lp_Print(0, fmt, ap);
     va_end(ap);
+    return printed;
 }
 
-void puts(const char *s)
+int puts(const char *s)
 {
-	printf("%s", s);
+    return printf("%s\n", s);
+}
+
+int putchar(int c)
+{
+    char _c = c;
+    printf_output(&_c, 1);
+    return _c;
 }
