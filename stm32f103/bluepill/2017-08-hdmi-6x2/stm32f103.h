@@ -274,6 +274,7 @@ struct gpio_regs {
 #define GPIOA	((struct gpio_regs *) 0x40010800)
 #define GPIOB	((struct gpio_regs *) 0x40010c00)
 #define GPIOC	((struct gpio_regs *) 0x40011000)
+#define GPIOD	((struct gpio_regs *) 0x40011400)
 
 struct dma_channel_regs {
 	volatile uint32_t CCR;

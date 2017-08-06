@@ -80,7 +80,7 @@ static void tasklet_run_next_scheduled(void)
 void tasklet_run_scheduled(void)
 {
 	if (!tasklet_scheduled_head) {
-		printf("no scheduled tasklets\n");
+		//printf("no scheduled tasklets\n");
 		return;
 	}
 	while (tasklet_scheduled_head) {

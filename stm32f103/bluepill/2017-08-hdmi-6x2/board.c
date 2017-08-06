@@ -3,8 +3,6 @@
 #include <stdio.h>
 
 #include "stm32f103.h"
-#include "usb.h"
-#include "jtag.h"
 
 #define GPIO_CONFIG_TX		0xa	// Alternate function push-pull 2MHz
 #define GPIO_CONFIG_RX		0x4	// Floating input
@@ -77,12 +75,11 @@ struct ring_info uart3_rx_info = {
 char uart_tx_ring[1024];
 int empty;
 uint32_t uart_tx_rptr, uart_tx_wptr;
-uint32_t usb_tx_rptr;
 #define UART_TX_PTR_MASK (sizeof(uart_tx_ring) - 1)
 
 void uart_init(void)
 {
-	uart_tx_rptr = uart_tx_wptr = usb_tx_rptr = 0;
+	uart_tx_rptr = uart_tx_wptr = 0;
 	empty = 1;
 
 	// Enable alternate function IO, GPIOA and USART1
@@ -107,29 +104,6 @@ void uart_init(void)
 
 	// Enable USART1 interrupts
 	NVIC_EnableIRQ(USART1_IRQn);
-
-	// Enable alternate function IO, GPIOB and USART3
-	RCC->APB1ENR |= RCC_APB1ENR_USART3EN;
-	RCC->APB2ENR |= RCC_APB2ENR_AFIOEN;
-	RCC->APB2ENR |= RCC_APB2ENR_IOPBEN;
-
-	// Configure TX pin on PB10
-	GPIOB->CRH &= ~(0xF << 8);
-	GPIOB->CRH |= GPIO_CONFIG_TX << 8;
-
-	// Configure RX pin on PB11
-	GPIOB->CRH &= ~(0xF << 12);
-	GPIOB->CRH |= GPIO_CONFIG_RX << 12;
-
-	// Setup UART1
-	USART3->CR1 = USART_CR1_UE|USART_CR1_RXNEIE|USART_CR1_TE|USART_CR1_RE;
-	USART3->CR2 = 0x0000;
-	USART3->CR3 = 0x0000;
-	USART3->BRR = SYS_CLOCK / 2 / 115200;
-	USART3->GTPR = 0x0000;
-
-	// Enable USART3 interrupts
-	NVIC_EnableIRQ(USART3_IRQn);
 }
 
 static int uart_try_putc(int ch)
@@ -142,10 +116,6 @@ static int uart_try_putc(int ch)
 	if (likely(((uart_tx_wptr + 1) & UART_TX_PTR_MASK) != uart_tx_rptr)) {
 		uart_tx_ring[uart_tx_wptr++] = ch;
 		uart_tx_wptr &= UART_TX_PTR_MASK;
-		if (uart_tx_wptr == usb_tx_rptr) {
-			usb_tx_rptr += 1;
-			usb_tx_rptr &= UART_TX_PTR_MASK;
-		}
 	} else {
 		retval = 0;
 	}
@@ -180,60 +150,6 @@ void USART1_IRQHandler(void)
 		char c = USART1->DR;
 		uart_try_putc(c);
 	}
-}
-
-volatile int usb_ring_full;
-volatile int usb_overrun;
-volatile int usb_noise;
-volatile int usb_puts, usb_gets;
-
-void USART3_IRQHandler(void)
-{
-	uint32_t sr = USART3->SR;
-
-	if (sr & USART_SR_RXNE) {
-		char c = USART3->DR;
-		if (!ring_try_putc(&uart3_rx_info, c)) {
-			usb_ring_full++;
-		} else {
-			usb_puts++;
-		}
-	}
-	if (sr & USART_SR_TXE) {
-		char c;
-		if (ring_try_getc(&uart3_tx_info, &c)) {
-			USART3->DR = c;
-		} else {
-			// Disable USART TX empty irq
-			USART3->CR1 &= ~USART_CR1_TXEIE;
-		}
-	}
-	if (sr & USART_SR_ORE) {
-		usb_overrun++;
-	}
-	if (sr & USART_SR_NE) {
-		usb_noise++;
-	}
-}
-
-int usb_try_getc(char *c)
-{
-	int ret = ring_try_getc(&uart3_rx_info, c);
-	if (ret) {
-		usb_gets++;
-	}
-	return ret;
-}
-
-int usb_try_putc(char c)
-{
-	int ret = ring_try_putc(&uart3_tx_info, c);
-	if (ret) {
-		USART3->CR1 |= USART_CR1_TXEIE;
-	} else {
-		usb_ring_full++;
-	}
-	return ret;
 }
 
 volatile int uart_wfi;
@@ -325,6 +241,5 @@ void SystemInit(void)
 	systick_init();
 	dma_init();
 	uart_init();
-	jtag_init();
-	usb_init();
+	RCC->APB2ENR |= RCC_APB2ENR_IOPBEN | RCC_APB2ENR_IOPCEN | RCC_APB2ENR_IOPDEN;
 }

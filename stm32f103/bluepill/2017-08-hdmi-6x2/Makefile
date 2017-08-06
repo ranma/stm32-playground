@@ -1,5 +1,7 @@
 CROSS_COMPILE	:= arm-none-eabi-
-TEXT_START	:= 0x08002000
+TEXT_START	:= 0x20002300
+LINKER_SCRIPT	:= loader.lds.ram
+#LINKER_SCRIPT	:= loader.lds.flash
 
 CC		:= $(CROSS_COMPILE)gcc
 LD		:= $(CROSS_COMPILE)ld
@@ -18,9 +20,10 @@ CFLAGS		= -Wall -Wstrict-prototypes -Os -g \
 ASFLAGS		:= $(CFLAGS) -D__ASSEMBLY__
 
 LDFLAGS		= -static -g --gc-sections -L /usr/lib/arm-none-eabi/newlib/armv7-m
-LDFLAGS		+= -e startup -T loader.lds -Map loader.map -Ttext $(TEXT_START)
 
-OBJECTS		:= board.o loader.o jtag.o usb.o printf.o tasklet.o startup_ARMCM3.o
+LDFLAGS		+= -e startup -T $(LINKER_SCRIPT) -Map loader.map -Ttext $(TEXT_START)
+
+OBJECTS		:= board.o loader.o printf.o tasklet.o startup_ARMCM3.o
 
 all: loader.bin
 
